@@ -1,0 +1,41 @@
+name: Build PLDMGR Install Update
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "main.c"
+      - "Makefile"
+      - "tools/gen_asset.py"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare PS5 SDK build image
+        run: |
+          git clone --depth 1 https://github.com/itsPLK/ps5-payload-manager.git /tmp/pldmgr
+          docker build \
+            -t hiddenkernel-ps5-sdk \
+            -f /tmp/pldmgr/Dockerfile.sdk \
+            /tmp/pldmgr
+
+      - name: Build ELF
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            hiddenkernel-ps5-sdk \
+            make clean all
+
+      - name: Upload ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: PLDMGR-Install-Update
+          path: PLDMGR-Install-Update.elf
+          if-no-files-found: error
