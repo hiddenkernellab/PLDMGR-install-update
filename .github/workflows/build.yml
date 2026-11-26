@@ -2,40 +2,62 @@ name: Build PLDMGR Install Update
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_beta:
+        description: 'Publicar v0.2.0-beta tras probar el artefacto en PS5'
+        type: boolean
+        default: false
   push:
     paths:
-      - "main.c"
-      - "Makefile"
-      - "tools/gen_asset.py"
-      - ".github/workflows/build.yml"
+      - 'main.c'
+      - 'Makefile'
+      - 'tools/gen_asset.py'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hkl-pldmgr-build
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Prepare PS5 SDK build image
         run: |
           git clone --depth 1 https://github.com/itsPLK/ps5-payload-manager.git /tmp/pldmgr
-          docker build \
-            -t hiddenkernel-ps5-sdk \
-            -f /tmp/pldmgr/Dockerfile.sdk \
-            /tmp/pldmgr
-
+          docker build -t hiddenkernel-ps5-sdk -f /tmp/pldmgr/Dockerfile.sdk /tmp/pldmgr
       - name: Build ELF
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}:/src" \
-            -w /src \
-            hiddenkernel-ps5-sdk \
-            make clean all
-
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src hiddenkernel-ps5-sdk make clean all
+          sha256sum HK-PLDMGR-Install-Update.elf > HK-PLDMGR-Install-Update.elf.sha256
       - name: Upload ELF
         uses: actions/upload-artifact@v4
         with:
           name: HK-PLDMGR-Install-Update
-          path: HK-PLDMGR-Install-Update.elf
+          path: |
+            HK-PLDMGR-Install-Update.elf
+            HK-PLDMGR-Install-Update.elf.sha256
           if-no-files-found: error
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_beta && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: HK-PLDMGR-Install-Update
+      - name: Publish beta without replacing existing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ github.sha }}
+        run: |
+          sha256sum -c HK-PLDMGR-Install-Update.elf.sha256
+          gh release create v0.2.0-beta --target "$TARGET" --prerelease --title 'PLDMGR Install & Update v0.2.0-beta' --notes 'Beta: conserva autoload.txt, valida SHA-256 del activo oficial de itsPLK, conserva copia anterior y diagnostica errores de red. No autocargar. Validar en PS5 antes de uso habitual.' HK-PLDMGR-Install-Update.elf HK-PLDMGR-Install-Update.elf.sha256
