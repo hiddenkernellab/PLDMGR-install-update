@@ -1,1128 +1,181 @@
+/* HiddenKernel PLDMGR Install & Update v0.2.0-beta.
+ * Official itsPLK release, asset digest, bounded downloads, preserved autoload.
+ * Manual invocation only. No other payloads executed and no USB changes.
+ */
+#define _POSIX_C_SOURCE 200809L
 #include <curl/curl.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/version.h>
+#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include "assets_cacert_pem.h"
-
-#define APP_NAME "PLDMGR Install & Update"
-
-#define RELEASE_API \
-    "https://api.github.com/repos/itsPLK/ps5-payload-manager/releases/latest"
-
-#define RELEASE_PREFIX \
-    "https://github.com/itsPLK/ps5-payload-manager/releases/download/"
-
+#ifndef AUTOLOADER_DIR
 #define AUTOLOADER_DIR "/data/ps5_autoloader"
-
-#define PLDMGR_FILE AUTOLOADER_DIR "/pldmgr.elf"
-#define PLDMGR_TEMP AUTOLOADER_DIR "/pldmgr.elf.tmp"
-#define PLDMGR_BACKUP AUTOLOADER_DIR "/pldmgr.elf.bak"
-
-#define AUTOLOAD_FILE AUTOLOADER_DIR "/autoload.txt"
-#define AUTOLOAD_TEMP AUTOLOADER_DIR "/autoload.txt.tmp"
-#define AUTOLOAD_BACKUP AUTOLOADER_DIR "/autoload.txt.bak"
-
-#define VERSION_FILE AUTOLOADER_DIR "/pldmgr.version"
-#define VERSION_TEMP AUTOLOADER_DIR "/pldmgr.version.tmp"
-#define VERSION_BACKUP AUTOLOADER_DIR "/pldmgr.version.bak"
-
-#define MIN_ELF_SIZE (64 * 1024)
-#define MAX_ELF_SIZE (32 * 1024 * 1024)
-
-typedef struct {
-    char useless1[45];
-    char message[3075];
-} notify_request_t;
-
-int sceKernelSendNotificationRequest(
-    int device,
-    notify_request_t *req,
-    size_t size,
-    int blocking
-);
-
-typedef struct {
-    char *data;
-    size_t size;
-} memory_buffer_t;
-
-
-/* ============================================================
-   NOTIFICACIONES
-   ============================================================ */
-
-static void notify(const char *fmt, ...)
-{
-    notify_request_t req;
-    va_list args;
-
-    memset(&req, 0, sizeof(req));
-
-    va_start(args, fmt);
-    vsnprintf(req.message, sizeof(req.message), fmt, args);
-    va_end(args);
-
-    sceKernelSendNotificationRequest(
-        0,
-        &req,
-        sizeof(req),
-        0
-    );
+#endif
+#define APP "PLDMGR Install & Update 0.2.0-beta"
+#define RELEASE_API "https://api.github.com/repos/itsPLK/ps5-payload-manager/releases/latest"
+#define RELEASE_PREFIX "https://github.com/itsPLK/ps5-payload-manager/releases/download/"
+#define ELF AUTOLOADER_DIR "/pldmgr.elf"
+#define BACKUP AUTOLOADER_DIR "/pldmgr.elf.bak"
+#define AUTOLOAD AUTOLOADER_DIR "/autoload.txt"
+#define VERSION AUTOLOADER_DIR "/pldmgr.version"
+#define LOCK AUTOLOADER_DIR "/.hkl-update.lock"
+#define MAX_ELF (32u*1024u*1024u)
+#define MIN_ELF (64u*1024u)
+#define MAX_JSON (2u*1024u*1024u)
+#define MAX_AUTOLOAD (256u*1024u)
+typedef struct { char unused[45]; char message[3075]; } notify_request_t;
+extern int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
+static void notify(const char *fmt, ...) {
+    notify_request_t r = {0}; va_list ap; va_start(ap,fmt);
+    vsnprintf(r.message,sizeof r.message,fmt,ap); va_end(ap);
+    sceKernelSendNotificationRequest(0,&r,sizeof r,0);
 }
-
-
-/* ============================================================
-   UTILIDADES DE ARCHIVO
-   ============================================================ */
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0;
+/* A small strict JSON scanner; fields are found in the actual object, not in
+ * escaped release notes or neighbouring assets. No general-purpose decoding
+ * needed: all accepted tag/name/URL/digest values must be unescaped ASCII. */
+typedef struct { const char *a,*b; } span;
+static const char *ws(const char *p,const char *e) { while(p<e && isspace((unsigned char)*p))p++; return p; }
+static const char *skip(const char *p,const char *e,unsigned depth) {
+    p=ws(p,e); if(p==e || depth>48)return NULL;
+    if(*p=='"') { for(++p;p<e;p++){ if(*p=='"')return p+1; if(*p=='\\'){if(++p==e)return NULL;} else if((unsigned char)*p<32)return NULL; } return NULL; }
+    if(*p=='{' || *p=='[') { int obj=*p=='{'; char close=obj?'}':']'; p=ws(p+1,e); if(p<e&&*p==close)return p+1;
+        for(;;){ if(obj){if(p==e||*p!='"')return NULL; p=skip(p,e,depth+1); if(!p)return NULL; p=ws(p,e);if(p==e||*p!=':')return NULL;p++;}
+            p=skip(p,e,depth+1); if(!p)return NULL;p=ws(p,e);if(p==e)return NULL;if(*p==close)return p+1;if(*p!=',')return NULL;p=ws(p+1,e); }
+    }
+    const char *a=p;while(p<e&&!isspace((unsigned char)*p)&&*p!=','&&*p!=']'&&*p!='}')p++;return p>a?p:NULL;
 }
-
-static void cleanup_temp_files(void)
-{
-    remove(PLDMGR_TEMP);
-    remove(AUTOLOAD_TEMP);
-    remove(VERSION_TEMP);
+static int equal(span x,const char *v) { return x.a&&x.b-x.a==(ptrdiff_t)strlen(v)&&memcmp(x.a,v,strlen(v))==0; }
+static span field(span obj,const char *key) {
+    span none={0}; const char *p=ws(obj.a,obj.b); if(p==obj.b||*p!='{')return none;
+    p=ws(p+1,obj.b); span result={0};
+    while(p<obj.b&&*p!='}') { const char *k=p; const char *end=skip(p,obj.b,0);if(!end||*k!='"')return none;
+        p=ws(end,obj.b);if(p==obj.b||*p!=':')return none;p=ws(p+1,obj.b);const char *v=skip(p,obj.b,0);if(!v)return none;
+        if(end-k==(ptrdiff_t)strlen(key)+2&&!memcmp(k+1,key,strlen(key))) {if(result.a)return none;result=(span){p,v};}
+        p=ws(v,obj.b);if(p<obj.b&&*p==',')p=ws(p+1,obj.b);else break;
+    } return result;
 }
-
-static int read_small_text(
-    const char *path,
-    char *out,
-    size_t out_size
-)
-{
-    FILE *fp;
-    size_t n;
-
-    if (!out || out_size == 0) {
-        return -1;
-    }
-
-    out[0] = '\0';
-
-    fp = fopen(path, "rb");
-    if (!fp) {
-        return -1;
-    }
-
-    n = fread(out, 1, out_size - 1, fp);
-    fclose(fp);
-
-    out[n] = '\0';
-
-    while (
-        n > 0 &&
-        (
-            out[n - 1] == '\n' ||
-            out[n - 1] == '\r' ||
-            out[n - 1] == ' ' ||
-            out[n - 1] == '\t'
-        )
-    ) {
-        out[n - 1] = '\0';
-        n--;
-    }
-
-    return 0;
+static int string(span x,char *out,size_t n) {
+    if(!x.a||x.b-x.a<2||*x.a!='"'||x.b[-1]!='"'||(size_t)(x.b-x.a-2)>=n)return -1;
+    size_t len=(size_t)(x.b-x.a-2);for(size_t i=0;i<len;i++){unsigned char c=x.a[i+1];if(c<32||c>126||c=='\\'||c=='"')return -1;}memcpy(out,x.a+1,len);out[len]=0;return 0;
 }
-
-static int write_text_file(
-    const char *path,
-    const char *text,
-    mode_t mode
-)
-{
-    FILE *fp;
-    size_t len;
-    int ok;
-
-    fp = fopen(path, "wb");
-    if (!fp) {
-        return -1;
-    }
-
-    len = strlen(text);
-    ok = fwrite(text, 1, len, fp) == len;
-
-    if (ok && fflush(fp) != 0) {
-        ok = 0;
-    }
-
-    if (ok && fsync(fileno(fp)) != 0) {
-        ok = 0;
-    }
-
-    if (fclose(fp) != 0) {
-        ok = 0;
-    }
-
-    if (!ok) {
-        remove(path);
-        return -1;
-    }
-
-    chmod(path, mode);
-    return 0;
-}
-
-
-/* ============================================================
-   CURL / HTTPS
-   ============================================================ */
-
-static size_t write_memory(
-    void *ptr,
-    size_t size,
-    size_t nmemb,
-    void *userdata
-)
-{
-    memory_buffer_t *buffer = (memory_buffer_t *)userdata;
-    size_t total = size * nmemb;
-    char *new_data;
-
-    new_data = realloc(
-        buffer->data,
-        buffer->size + total + 1
-    );
-
-    if (!new_data) {
-        return 0;
-    }
-
-    buffer->data = new_data;
-
-    memcpy(
-        buffer->data + buffer->size,
-        ptr,
-        total
-    );
-
-    buffer->size += total;
-    buffer->data[buffer->size] = '\0';
-
-    return total;
-}
-
-static size_t write_file(
-    void *ptr,
-    size_t size,
-    size_t nmemb,
-    void *userdata
-)
-{
-    return fwrite(
-        ptr,
-        size,
-        nmemb,
-        (FILE *)userdata
-    );
-}
-
-static int setup_curl(
-    CURL *curl,
-    const char *url
-)
-{
-    struct curl_blob ca_blob;
-
-    memset(&ca_blob, 0, sizeof(ca_blob));
-
-    ca_blob.data = hk_cacert_pem;
-    ca_blob.len = hk_cacert_pem_len;
-    ca_blob.flags = CURL_BLOB_COPY;
-
-    if (curl_easy_setopt(curl, CURLOPT_URL, url) != CURLE_OK) {
-        return -1;
-    }
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_USERAGENT,
-        "HiddenKernel-PLDMGR-Install-Update/1.0"
-    );
-
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
-
-    /* HTTPS verification enabled. */
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca_blob);
-
-    return 0;
-}
-
-static int request_ok(
-    CURL *curl,
-    CURLcode result
-)
-{
-    long http_code = 0;
-
-    curl_easy_getinfo(
-        curl,
-        CURLINFO_RESPONSE_CODE,
-        &http_code
-    );
-
-    return (
-        result == CURLE_OK &&
-        http_code >= 200 &&
-        http_code < 300
-    );
-}
-
-
-/* ============================================================
-   DESCARGAS
-   ============================================================ */
-
-static char *download_text(const char *url)
-{
-    CURL *curl;
-    memory_buffer_t buffer;
-    struct curl_slist *headers;
-    CURLcode result;
-    int ok;
-
-    curl = curl_easy_init();
-    if (!curl) {
-        return NULL;
-    }
-
-    memset(&buffer, 0, sizeof(buffer));
-
-    if (setup_curl(curl, url) != 0) {
-        curl_easy_cleanup(curl);
-        return NULL;
-    }
-
-    headers = NULL;
-
-    headers = curl_slist_append(
-        headers,
-        "Accept: application/vnd.github+json"
-    );
-
-    headers = curl_slist_append(
-        headers,
-        "X-GitHub-Api-Version: 2022-11-28"
-    );
-
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_memory);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-
-    result = curl_easy_perform(curl);
-    ok = request_ok(curl, result);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (!ok) {
-        free(buffer.data);
-        return NULL;
-    }
-
-    return buffer.data;
-}
-
-static int download_file(
-    const char *url,
-    const char *destination
-)
-{
-    FILE *file;
-    CURL *curl;
-    CURLcode result;
-    int ok;
-
-    file = fopen(destination, "wb");
-    if (!file) {
-        return -1;
-    }
-
-    curl = curl_easy_init();
-
-    if (!curl) {
-        fclose(file);
-        remove(destination);
-        return -1;
-    }
-
-    if (setup_curl(curl, url) != 0) {
-        curl_easy_cleanup(curl);
-        fclose(file);
-        remove(destination);
-        return -1;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
-
-    result = curl_easy_perform(curl);
-    ok = request_ok(curl, result);
-
-    curl_easy_cleanup(curl);
-
-    if (fflush(file) != 0) {
-        ok = 0;
-    }
-
-    if (fsync(fileno(file)) != 0) {
-        ok = 0;
-    }
-
-    if (fclose(file) != 0) {
-        ok = 0;
-    }
-
-    if (!ok) {
-        remove(destination);
-        return -1;
-    }
-
-    return 0;
-}
-
-
-/* ============================================================
-   PARSEO DE RELEASE OFICIAL
-   ============================================================ */
-
-static int starts_with(
-    const char *text,
-    const char *prefix
-)
-{
-    return strncmp(
-        text,
-        prefix,
-        strlen(prefix)
-    ) == 0;
-}
-
-static int ends_with(
-    const char *text,
-    const char *suffix
-)
-{
-    size_t text_length = strlen(text);
-    size_t suffix_length = strlen(suffix);
-
-    if (suffix_length > text_length) {
-        return 0;
-    }
-
-    return strcmp(
-        text + text_length - suffix_length,
-        suffix
-    ) == 0;
-}
-
-static int find_json_string(
-    const char *json,
-    const char *key,
-    char *output,
-    size_t output_size
-)
-{
-    char needle[128];
-    const char *cursor;
-    const char *colon;
-    const char *start;
-    const char *end;
-    size_t length;
-
-    snprintf(
-        needle,
-        sizeof(needle),
-        "\"%s\"",
-        key
-    );
-
-    cursor = strstr(json, needle);
-    if (!cursor) {
-        return -1;
-    }
-
-    colon = strchr(cursor, ':');
-    if (!colon) {
-        return -1;
-    }
-
-    start = strchr(colon, '"');
-    if (!start) {
-        return -1;
-    }
-
-    start++;
-
-    end = strchr(start, '"');
-    if (!end) {
-        return -1;
-    }
-
-    length = (size_t)(end - start);
-
-    if (
-        length == 0 ||
-        length >= output_size
-    ) {
-        return -1;
-    }
-
-    memcpy(output, start, length);
-    output[length] = '\0';
-
-    return 0;
-}
-
-static int find_pldmgr_url(
-    const char *json,
-    char *output,
-    size_t output_size
-)
-{
-    const char *cursor = json;
-
-    while (
-        (
-            cursor = strstr(
-                cursor,
-                "\"browser_download_url\""
-            )
-        ) != NULL
-    ) {
-        const char *colon;
-        const char *start;
-        const char *end;
-        size_t length;
-
-        colon = strchr(cursor, ':');
-        if (!colon) {
-            return -1;
+static int tag_ok(const char *s) { if(!*s)return 0; for(;*s;s++)if(!isalnum((unsigned char)*s)&&*s!='.'&&*s!='-'&&*s!='_')return 0;return 1; }
+static int hex_digest(const char *s) { if(strlen(s)!=71||strncmp(s,"sha256:",7))return 0;for(s+=7;*s;s++)if(!isxdigit((unsigned char)*s))return 0;return 1; }
+static int select_release(const char *json,size_t n,char tag[128],char url[1024],char sha[65]) {
+    const char *end=json+n,*start=ws(json,end),*tail=skip(start,end,0);if(!tail||ws(tail,end)!=end)return -1;span root={start,tail};
+    if(!equal(field(root,"draft"),"false")||!equal(field(root,"prerelease"),"false")||string(field(root,"tag_name"),tag,128)||!tag_ok(tag))return -1;
+    span a=field(root,"assets");if(!a.a||*a.a!='[')return -1;const char *p=ws(a.a+1,a.b);int count=0;
+    char wanted[180],expected[1024];int nn=snprintf(wanted,sizeof wanted,"pldmgr_%s.elf",tag);if(nn<0||(size_t)nn>=sizeof wanted)return -1;
+    while(p<a.b&&*p!=']') {const char *q=skip(p,a.b,0);if(!q)return -1;span x={p,q};char name[180],candidate[1024],digest[72];
+        if(!string(field(x,"name"),name,sizeof name)&&(!strcmp(name,wanted)||!strcmp(name,"pldmgr.elf"))) {
+            if(++count!=1||!equal(field(x,"state"),"\"uploaded\"")||string(field(x,"browser_download_url"),candidate,sizeof candidate)||string(field(x,"digest"),digest,sizeof digest)||!hex_digest(digest))return -1;
+            int k=snprintf(expected,sizeof expected,"%s%s/%s",RELEASE_PREFIX,tag,name);if(k<0||(size_t)k>=sizeof expected||strcmp(candidate,expected))return -1;
+            strcpy(url,candidate);for(int i=0;i<64;i++)sha[i]=(char)tolower((unsigned char)digest[i+7]);sha[64]=0;
         }
-
-        start = strchr(colon, '"');
-        if (!start) {
-            return -1;
-        }
-
-        start++;
-
-        end = strchr(start, '"');
-        if (!end) {
-            return -1;
-        }
-
-        length = (size_t)(end - start);
-
-        if (
-            length > 0 &&
-            length < output_size &&
-            length < 1024
-        ) {
-            char candidate[1024];
-
-            memcpy(candidate, start, length);
-            candidate[length] = '\0';
-
-            if (
-                starts_with(
-                    candidate,
-                    RELEASE_PREFIX
-                ) &&
-                strstr(
-                    candidate,
-                    "pldmgr"
-                ) != NULL &&
-                ends_with(
-                    candidate,
-                    ".elf"
-                )
-            ) {
-                memcpy(
-                    output,
-                    candidate,
-                    length + 1
-                );
-
-                return 0;
+        p=ws(q,a.b);if(p<a.b&&*p==',')p=ws(p+1,a.b);else break;
+    }return count==1?0:-1;
+}
+typedef struct { unsigned char *data;size_t len,limit; } buffer;
+static size_t receive(void *p,size_t s,size_t n,void *ctx) {
+    buffer *b=ctx;if(s&&n>SIZE_MAX/s)return 0;size_t k=s*n;if(k>b->limit-b->len)return 0;
+    unsigned char *next=realloc(b->data,b->len+k+1);if(!next)return 0;b->data=next;memcpy(b->data+b->len,p,k);b->len+=k;b->data[b->len]=0;return k;
+}
+static int download(const char *url,buffer *b) {
+    CURL *c=curl_easy_init(); if(!c)return -1; char err[CURL_ERROR_SIZE]={0}; long http=0;
+    struct curl_blob ca={(void *)hk_cacert_pem,hk_cacert_pem_len,CURL_BLOB_COPY};
+    curl_easy_setopt(c,CURLOPT_URL,url);curl_easy_setopt(c,CURLOPT_USERAGENT,"HiddenKernel-PLDMGR/0.2.0-beta");
+    curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);curl_easy_setopt(c,CURLOPT_MAXREDIRS,5L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(c,CURLOPT_PROTOCOLS_STR,"https");curl_easy_setopt(c,CURLOPT_REDIR_PROTOCOLS_STR,"https");
+#else
+    curl_easy_setopt(c,CURLOPT_PROTOCOLS,(long)CURLPROTO_HTTPS);curl_easy_setopt(c,CURLOPT_REDIR_PROTOCOLS,(long)CURLPROTO_HTTPS);
+#endif
+    curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,15L);curl_easy_setopt(c,CURLOPT_TIMEOUT,120L);curl_easy_setopt(c,CURLOPT_ERRORBUFFER,err);
+    curl_easy_setopt(c,CURLOPT_SSL_VERIFYPEER,1L);curl_easy_setopt(c,CURLOPT_SSL_VERIFYHOST,2L);
+    if(curl_easy_setopt(c,CURLOPT_CAINFO_BLOB,&ca)!=CURLE_OK){curl_easy_cleanup(c);notify("%s: no se pudo configurar TLS.",APP);return -1;}
+    curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,receive);curl_easy_setopt(c,CURLOPT_WRITEDATA,b);curl_easy_setopt(c,CURLOPT_MAXFILESIZE_LARGE,(curl_off_t)b->limit);
+    CURLcode rc=curl_easy_perform(c);curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&http);curl_easy_cleanup(c);
+    if(rc!=CURLE_OK||http<200||http>=300){
+        if(rc==CURLE_COULDNT_RESOLVE_HOST)notify("%s: DNS no responde; si usas 127.0.0.1, inicia tu DNS local y reintenta.",APP);
+        else if(rc==CURLE_PEER_FAILED_VERIFICATION||rc==CURLE_SSL_CONNECT_ERROR)notify("%s: error TLS; comprueba fecha/hora y certificados.",APP);
+        else notify("%s: fallo de red/HTTP %ld (%s).",APP,http,err[0]?err:curl_easy_strerror(rc));
+        return -1;
+    }return b->len?0:-1;
+}
+static int sha256(const unsigned char *data,size_t n,char out[65]) {
+    unsigned char hash[32];
+#if MBEDTLS_VERSION_MAJOR >= 3
+    if(mbedtls_sha256(data,n,hash,0)!=0)return -1;
+#else
+    if(mbedtls_sha256_ret(data,n,hash,0)!=0)return -1;
+#endif
+    static const char hex[]="0123456789abcdef";for(size_t i=0;i<32;i++){out[2*i]=hex[hash[i]>>4];out[2*i+1]=hex[hash[i]&15];}out[64]=0;return 0;
+}
+static int valid_elf(const buffer *b,const char *sha) {
+    char got[65];return b->len>=MIN_ELF&&b->len<=MAX_ELF&&!memcmp(b->data,"\177ELF\002\001",6)&&b->data[18]==0x3e&&b->data[19]==0&&!sha256(b->data,b->len,got)&&!strcmp(sha,got);
+}
+/* Returns 1 if missing, -1 if unreadable/unsafe, 0 if read. */
+static int read_local(const char *path,buffer *b) {
+    struct stat st;if(lstat(path,&st)){return errno==ENOENT?1:-1;}if(!S_ISREG(st.st_mode)||st.st_size<0||(uintmax_t)st.st_size>b->limit)return -1;
+    FILE *f=fopen(path,"rb");if(!f)return -1;b->data=malloc((size_t)st.st_size+1);if(!b->data){fclose(f);return -1;}b->len=fread(b->data,1,(size_t)st.st_size,f);int ok=b->len==(size_t)st.st_size&&!ferror(f)&&fgetc(f)==EOF;fclose(f);b->data[b->len]=0;return ok?0:-1;
+}
+static int write_atomic(const char *path,const void *data,size_t n,mode_t mode) {
+    char tmp[512];int z=snprintf(tmp,sizeof tmp,"%s.tmp.XXXXXX",path);if(z<0||(size_t)z>=sizeof tmp)return -1;int fd=mkstemp(tmp);if(fd<0)return -1;
+    FILE *f=fdopen(fd,"wb");if(!f){close(fd);unlink(tmp);return -1;}int ok=fwrite(data,1,n,f)==n&&!fflush(f)&&!fsync(fd)&&!fchmod(fd,mode);if(fclose(f))ok=0;
+    if(ok&&!rename(tmp,path))return 0;
+    unlink(tmp);return -1;
+}
+/* Preserve every original byte. Recognise existing manager entries, including
+ * versioned or relative paths, and refuse ambiguous configurations. */
+static int autoload_status(const buffer *b) {
+    size_t pos=0;int seen=0;
+    if(b->len&&memchr(b->data,0,b->len))return -1;
+    while(pos<b->len){size_t end=pos;while(end<b->len&&b->data[end]!='\n')end++;size_t a=pos,z=end;while(a<z&&isspace(b->data[a]))a++;while(z>a&&isspace(b->data[z-1]))z--;
+        if(a<z&&b->data[a]!='#'&&b->data[a]!=';'&&b->data[a]!='!'){size_t base=a;for(size_t k=a;k<z;k++)if(b->data[k]=='/')base=k+1;size_t n=z-base;
+            if(n>=10&&!memcmp(b->data+base,"pldmgr",6)&&!memcmp(b->data+z-4,".elf",4)){
+                if(n!=10||memcmp(b->data+base,"pldmgr.elf",10)||++seen>1)return -1;
+                if(base!=a&&!(base-a==2&&!memcmp(b->data+a,"./",2))&&!(z-a==strlen(ELF)&&!memcmp(b->data+a,ELF,z-a)))return -1;
             }
-        }
-
-        cursor = end + 1;
-    }
-
-    return -1;
+        }pos=end+1;
+    }return seen;
 }
-
-
-/* ============================================================
-   VALIDACIONES LOCALES
-   ============================================================ */
-
-static int validate_elf(const char *path)
-{
-    struct stat st;
-    FILE *file;
-    unsigned char magic[4];
-    size_t read_count;
-
-    if (stat(path, &st) != 0) {
-        return -1;
-    }
-
-    if (
-        st.st_size < MIN_ELF_SIZE ||
-        st.st_size > MAX_ELF_SIZE
-    ) {
-        return -1;
-    }
-
-    file = fopen(path, "rb");
-
-    if (!file) {
-        return -1;
-    }
-
-    read_count = fread(
-        magic,
-        1,
-        sizeof(magic),
-        file
-    );
-
-    fclose(file);
-
-    if (read_count != sizeof(magic)) {
-        return -1;
-    }
-
-    if (
-        magic[0] != 0x7F ||
-        magic[1] != 'E' ||
-        magic[2] != 'L' ||
-        magic[3] != 'F'
-    ) {
-        return -1;
-    }
-
-    return 0;
+static int ensure_autoload(const buffer *old,int missing) {
+    int status=autoload_status(old);if(status<0)return -1;if(status)return 0;
+    if(missing)return write_atomic(AUTOLOAD,"!3000\npldmgr.elf\n",strlen("!3000\npldmgr.elf\n"),0644);
+    const char *suffix=old->len&&old->data[old->len-1]!='\n'?"\npldmgr.elf\n":"pldmgr.elf\n";size_t n=strlen(suffix);unsigned char *out=malloc(old->len+n);if(!out)return -1;
+    if(old->len)memcpy(out,old->data,old->len);
+    memcpy(out+old->len,suffix,n);int rc=write_atomic(AUTOLOAD,out,old->len+n,0644);free(out);return rc;
 }
-
-static int autoload_is_correct(void)
-{
-    char content[128];
-
-    if (
-        read_small_text(
-            AUTOLOAD_FILE,
-            content,
-            sizeof(content)
-        ) != 0
-    ) {
-        return 0;
-    }
-
-    return (
-        strcmp(
-            content,
-            "!3000\npldmgr.elf"
-        ) == 0
-    );
-}
-
-
-/* ============================================================
-   PREPARAR ARCHIVOS TEMPORALES
-   ============================================================ */
-
-static int create_autoload_temp(void)
-{
-    return write_text_file(
-        AUTOLOAD_TEMP,
-        "!3000\npldmgr.elf\n",
-        0644
-    );
-}
-
-static int create_version_temp(
-    const char *version
-)
-{
-    char buffer[256];
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "%s\n",
-        version
-    );
-
-    return write_text_file(
-        VERSION_TEMP,
-        buffer,
-        0644
-    );
-}
-
-
-/* ============================================================
-   BACKUP / ROLLBACK
-   ============================================================ */
-
-static int backup_file(
-    const char *original,
-    const char *backup,
-    int *had_original
-)
-{
-    *had_original = 0;
-
-    remove(backup);
-
-    if (!file_exists(original)) {
-        return 0;
-    }
-
-    if (
-        rename(
-            original,
-            backup
-        ) != 0
-    ) {
-        return -1;
-    }
-
-    *had_original = 1;
-    return 0;
-}
-
-static void restore_backup(
-    const char *original,
-    const char *backup,
-    int had_original
-)
-{
-    remove(original);
-
-    if (
-        had_original &&
-        file_exists(backup)
-    ) {
-        rename(backup, original);
-    }
-}
-
-static int install_files(void)
-{
-    int had_pldmgr = 0;
-    int had_autoload = 0;
-    int had_version = 0;
-
-    if (
-        backup_file(
-            PLDMGR_FILE,
-            PLDMGR_BACKUP,
-            &had_pldmgr
-        ) != 0
-    ) {
-        return -1;
-    }
-
-    if (
-        backup_file(
-            AUTOLOAD_FILE,
-            AUTOLOAD_BACKUP,
-            &had_autoload
-        ) != 0
-    ) {
-        restore_backup(
-            PLDMGR_FILE,
-            PLDMGR_BACKUP,
-            had_pldmgr
-        );
-
-        return -1;
-    }
-
-    if (
-        backup_file(
-            VERSION_FILE,
-            VERSION_BACKUP,
-            &had_version
-        ) != 0
-    ) {
-        restore_backup(
-            PLDMGR_FILE,
-            PLDMGR_BACKUP,
-            had_pldmgr
-        );
-
-        restore_backup(
-            AUTOLOAD_FILE,
-            AUTOLOAD_BACKUP,
-            had_autoload
-        );
-
-        return -1;
-    }
-
-    if (
-        rename(
-            PLDMGR_TEMP,
-            PLDMGR_FILE
-        ) != 0
-    ) {
-        goto rollback;
-    }
-
-    chmod(PLDMGR_FILE, 0755);
-
-    if (
-        rename(
-            AUTOLOAD_TEMP,
-            AUTOLOAD_FILE
-        ) != 0
-    ) {
-        goto rollback;
-    }
-
-    chmod(AUTOLOAD_FILE, 0644);
-
-    if (
-        rename(
-            VERSION_TEMP,
-            VERSION_FILE
-        ) != 0
-    ) {
-        goto rollback;
-    }
-
-    chmod(VERSION_FILE, 0644);
-
-    remove(PLDMGR_BACKUP);
-    remove(AUTOLOAD_BACKUP);
-    remove(VERSION_BACKUP);
-
-    return 0;
-
-rollback:
-
-    restore_backup(
-        PLDMGR_FILE,
-        PLDMGR_BACKUP,
-        had_pldmgr
-    );
-
-    restore_backup(
-        AUTOLOAD_FILE,
-        AUTOLOAD_BACKUP,
-        had_autoload
-    );
-
-    restore_backup(
-        VERSION_FILE,
-        VERSION_BACKUP,
-        had_version
-    );
-
-    return -1;
-}
-
-
-/* ============================================================
-   MAIN
-   ============================================================ */
-
-int main(
-    int argc,
-    char **argv
-)
-{
-    char *release_json;
-    char latest_version[128];
-    char installed_version[128];
-    char download_url[1024];
-    int needs_install = 0;
-
-    (void)argc;
-    (void)argv;
-
-    notify(
-        "%s: comprobando actualizaciones...",
-        APP_NAME
-    );
-
-    /*
-        Si la carpeta no existe, se crea.
-    */
-    if (
-        mkdir(
-            AUTOLOADER_DIR,
-            0777
-        ) != 0 &&
-        errno != EEXIST
-    ) {
-        notify(
-            "%s: no se pudo crear %s",
-            APP_NAME,
-            AUTOLOADER_DIR
-        );
-
-        return -1;
-    }
-
-    cleanup_temp_files();
-
-    if (
-        curl_global_init(
-            CURL_GLOBAL_ALL
-        ) != 0
-    ) {
-        notify(
-            "%s: error inicializando red.",
-            APP_NAME
-        );
-
-        return -1;
-    }
-
-    /*
-        Consulta SIEMPRE la última release oficial.
-    */
-    release_json = download_text(
-        RELEASE_API
-    );
-
-    if (!release_json) {
-        notify(
-            "%s: no se pudo consultar GitHub.",
-            APP_NAME
-        );
-
-        curl_global_cleanup();
-        return -1;
-    }
-
-    memset(
-        latest_version,
-        0,
-        sizeof(latest_version)
-    );
-
-    memset(
-        download_url,
-        0,
-        sizeof(download_url)
-    );
-
-    if (
-        find_json_string(
-            release_json,
-            "tag_name",
-            latest_version,
-            sizeof(latest_version)
-        ) != 0
-    ) {
-        notify(
-            "%s: no se pudo detectar la versión disponible.",
-            APP_NAME
-        );
-
-        free(release_json);
-        curl_global_cleanup();
-        return -1;
-    }
-
-    if (
-        find_pldmgr_url(
-            release_json,
-            download_url,
-            sizeof(download_url)
-        ) != 0
-    ) {
-        notify(
-            "%s: no se encontró pldmgr.elf en la release oficial.",
-            APP_NAME
-        );
-
-        free(release_json);
-        curl_global_cleanup();
-        return -1;
-    }
-
-    free(release_json);
-
-    installed_version[0] = '\0';
-
-    if (
-        read_small_text(
-            VERSION_FILE,
-            installed_version,
-            sizeof(installed_version)
-        ) != 0
-    ) {
-        installed_version[0] = '\0';
-    }
-
-    /*
-        Instalamos si:
-        - no existe pldmgr.elf;
-        - el ELF local no es válido;
-        - no existe el marcador de versión;
-        - la versión oficial ha cambiado;
-        - autoload.txt falta o no contiene nuestra configuración.
-    */
-    if (!file_exists(PLDMGR_FILE)) {
-        needs_install = 1;
-    }
-
-    if (
-        !needs_install &&
-        validate_elf(PLDMGR_FILE) != 0
-    ) {
-        needs_install = 1;
-    }
-
-    if (
-        !needs_install &&
-        installed_version[0] == '\0'
-    ) {
-        needs_install = 1;
-    }
-
-    if (
-        !needs_install &&
-        strcmp(
-            installed_version,
-            latest_version
-        ) != 0
-    ) {
-        needs_install = 1;
-    }
-
-    if (
-        !needs_install &&
-        !autoload_is_correct()
-    ) {
-        needs_install = 1;
-    }
-
-    if (!needs_install) {
-        notify(
-            "%s: ya tienes la última versión (%s).",
-            APP_NAME,
-            latest_version
-        );
-
-        curl_global_cleanup();
-        return 0;
-    }
-
-    notify(
-        "%s: instalando %s...",
-        APP_NAME,
-        latest_version
-    );
-
-    if (
-        download_file(
-            download_url,
-            PLDMGR_TEMP
-        ) != 0
-    ) {
-        notify(
-            "%s: error descargando Payload Manager.",
-            APP_NAME
-        );
-
-        cleanup_temp_files();
-        curl_global_cleanup();
-        return -1;
-    }
-
-    if (
-        validate_elf(
-            PLDMGR_TEMP
-        ) != 0
-    ) {
-        notify(
-            "%s: el archivo descargado no es un ELF válido.",
-            APP_NAME
-        );
-
-        cleanup_temp_files();
-        curl_global_cleanup();
-        return -1;
-    }
-
-    if (
-        create_autoload_temp()
-        != 0
-    ) {
-        notify(
-            "%s: error preparando autoload.txt.",
-            APP_NAME
-        );
-
-        cleanup_temp_files();
-        curl_global_cleanup();
-        return -1;
-    }
-
-    if (
-        create_version_temp(
-            latest_version
-        ) != 0
-    ) {
-        notify(
-            "%s: error preparando la versión instalada.",
-            APP_NAME
-        );
-
-        cleanup_temp_files();
-        curl_global_cleanup();
-        return -1;
-    }
-
-    if (
-        install_files()
-        != 0
-    ) {
-        notify(
-            "%s: error instalando; se intentó restaurar la copia anterior.",
-            APP_NAME
-        );
-
-        cleanup_temp_files();
-        curl_global_cleanup();
-        return -1;
-    }
-
-    notify(
-        "%s: %s instalado correctamente.",
-        APP_NAME,
-        latest_version
-    );
-
-    notify(
-        "autoload.txt configurado con Payload Manager."
-    );
-
-    curl_global_cleanup();
-    return 0;
+int main(void) {
+    int rc=1,fd=-1,curl_ready=0;char tag[128],url[1024],sha[65];
+    buffer json={.limit=MAX_JSON},local={.limit=MAX_ELF},fresh={.limit=MAX_ELF},auto_old={.limit=MAX_AUTOLOAD},auto_now={.limit=MAX_AUTOLOAD};
+    notify("%s: comprobando versión oficial...",APP);
+    if(mkdir(AUTOLOADER_DIR,0755)&&errno!=EEXIST){notify("%s: no se pudo crear carpeta.",APP);goto done;}
+    struct stat dir;if(lstat(AUTOLOADER_DIR,&dir)||!S_ISDIR(dir.st_mode)){notify("%s: ruta de autoloader inválida.",APP);goto done;}
+    fd=open(LOCK,O_CREAT|O_RDWR|O_NOFOLLOW,0600);struct flock lock={.l_type=F_WRLCK,.l_whence=SEEK_SET};if(fd<0||fcntl(fd,F_SETLK,&lock)){notify("%s: otro actualizador activo o bloqueo no disponible.",APP);goto done;}
+    int am=read_local(AUTOLOAD,&auto_old);if(am<0||autoload_status(&auto_old)<0){notify("%s: autoload no legible o contiene otra entrada PLDMGR; revisar manualmente. Sin cambios.",APP);goto done;}
+    int lm=read_local(ELF,&local);if(lm<0){notify("%s: ELF local no legible; sin cambios.",APP);goto done;}
+    if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK)goto done;
+    curl_ready=1;
+    if(download(RELEASE_API,&json))goto done;
+    if(select_release((const char *)json.data,json.len,tag,url,sha)){notify("%s: release oficial ambigua o sin SHA-256; sin cambios.",APP);goto done;}
+    int need=lm==1||!valid_elf(&local,sha);
+    if(need){if(download(url,&fresh))goto done;if(!valid_elf(&fresh,sha)){notify("%s: ELF o SHA-256 incorrecto; se conserva el original.",APP);goto done;}}
+    /* Check that configuration did not change while downloading. */
+    int now=read_local(AUTOLOAD,&auto_now);if(now!=am||auto_now.len!=auto_old.len||(auto_old.len&&memcmp(auto_old.data,auto_now.data,auto_old.len))){notify("%s: autoload cambió durante la operación; reintentar.",APP);goto done;}
+    if(need){if(lm==0&&write_atomic(BACKUP,local.data,local.len,0755)){notify("%s: no se pudo respaldar ELF anterior; sin cambios.",APP);goto done;}
+        if(write_atomic(ELF,fresh.data,fresh.len,0755)){notify("%s: instalación fallida; se conserva original.",APP);goto done;}}
+    if(ensure_autoload(&auto_old,am==1)){notify("%s: ELF validado; no se pudo actualizar autoload. Revisar manualmente.",APP);goto done;}
+    char v[140];snprintf(v,sizeof v,"%s\n",tag);if(write_atomic(VERSION,v,strlen(v),0644))notify("%s: instalado; marcador de versión no guardado.",APP);
+    notify("%s: %s %s. Autoload conservado. Si arrancas desde USB, revisa su configuración aparte.",APP,tag,need?"instalado":"ya verificado");rc=0;
+done:
+    free(json.data);free(local.data);free(fresh.data);free(auto_old.data);free(auto_now.data);if(curl_ready)curl_global_cleanup();if(fd>=0)close(fd);return rc;
 }
